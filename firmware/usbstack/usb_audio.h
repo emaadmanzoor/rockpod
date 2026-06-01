@@ -19,6 +19,8 @@
 #ifndef USB_AUDIO_H
 #define USB_AUDIO_H
 
+#include <stdint.h>
+
 #include "usb_ch9.h"
 #include "usb_class_driver.h"
 
@@ -275,6 +277,38 @@ bool usb_audio_source_streaming(void);
 unsigned long usb_audio_get_source_sampling_frequency(void);
 
 void usb_audio_set_source_sampling_frequency(unsigned long f);
+
+#define USB_AUDIO_SOURCE_MODE_PENDING 0
+#define USB_AUDIO_SOURCE_MODE_PCM16   1
+#define USB_AUDIO_SOURCE_MODE_ALAC    2
+
+/* Returns frames written, 0 if the USB ring is full, or <0 if unsupported. */
+int usb_audio_source_insert_alac(const int32_t *ch1, const int32_t *ch2,
+                                 int count, int codec_depth,
+                                 int file_depth,
+                                 unsigned long frequency,
+                                 unsigned int track_bitrate);
+
+/* Returns false while queued direct ALAC must drain before fallback starts. */
+bool usb_audio_source_use_pcm16_fallback(unsigned int track_bitrate);
+
+void usb_audio_source_flush(void);
+
+void usb_audio_source_pause(bool pause);
+
+int usb_audio_get_source_mode(void);
+
+int usb_audio_get_source_usb_bits(void);
+
+int usb_audio_get_source_codec_depth(void);
+
+int usb_audio_get_source_file_depth(void);
+
+unsigned long usb_audio_get_source_pcm_bitrate(void);
+
+unsigned int usb_audio_get_source_track_bitrate(void);
+
+unsigned long usb_audio_get_source_usb_bitrate(void);
 
 int usb_audio_get_source_ring_available(void);
 

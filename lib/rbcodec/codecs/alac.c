@@ -93,6 +93,8 @@ enum codec_status codec_run(void)
 
     /* initialise the sound converter */
     alac_set_info(&alac, demux_res.codecdata);
+    if (ci->set_source_sample_depth)
+        ci->set_source_sample_depth(alac.setinfo_sample_size);
 
     if (resume_time)
         did_resume = m4a_seek(&demux_res, &input_stream,

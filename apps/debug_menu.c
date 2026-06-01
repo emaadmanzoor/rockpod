@@ -2543,6 +2543,7 @@ static bool toggle_usb_serial(void)
 #ifdef USB_ENABLE_AUDIO
 static int dbg_usb_audio_cb(int action, struct gui_synclist *lists)
 {
+    const char *source_mode = "Pending";
     (void)lists;
     simplelist_reset_lines();
     simplelist_addline("%sabled", usb_core_driver_enabled(USB_DRIVER_AUDIO)?"En":"Dis");
@@ -2561,9 +2562,27 @@ static int dbg_usb_audio_cb(int action, struct gui_synclist *lists)
     simplelist_addline("%s", usb_audio_get_underflow()?"UNDERFLOW!":" ");
     simplelist_addline("%s", usb_audio_get_overflow()?"OVERFLOW!":" ");
     simplelist_addline("%s", usb_audio_get_alloc_failed()?"ALLOC FAILED!":" ");
+    switch (usb_audio_get_source_mode())
+    {
+    case USB_AUDIO_SOURCE_MODE_PCM16:
+        source_mode = "PCM16 fallback";
+        break;
+    case USB_AUDIO_SOURCE_MODE_ALAC:
+        source_mode = "ALAC direct";
+        break;
+    }
     simplelist_addline("Source: %s @ %lu Hz",
         usb_audio_source_streaming()?"Streaming":"Off",
         usb_audio_get_source_sampling_frequency());
+    simplelist_addline("Source mode: %s, USB %d-bit",
+        source_mode, usb_audio_get_source_usb_bits());
+    simplelist_addline("Source depth: file %d / codec %d",
+        usb_audio_get_source_file_depth(),
+        usb_audio_get_source_codec_depth());
+    simplelist_addline("Source bitrate: USB %lu / PCM %lu / file %u kbps",
+        usb_audio_get_source_usb_bitrate(),
+        usb_audio_get_source_pcm_bitrate(),
+        usb_audio_get_source_track_bitrate());
     simplelist_addline("Source ring: %d bytes",
         usb_audio_get_source_ring_available());
     simplelist_addline("Source underflows: %d",

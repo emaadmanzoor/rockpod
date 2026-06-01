@@ -3195,6 +3195,11 @@ static void audio_on_pause(bool pause)
         audio_on_codec_complete(codec_skip_status);
     }
 
+#if defined(USB_ENABLE_AUDIO) && defined(IPOD_6G)
+    if (usb_audio_source_streaming())
+        usb_audio_source_pause(pause);
+#endif
+
     bool do_fade = global_settings.fade_on_stop;
 
     pcmbuf_fade(do_fade, !pause);

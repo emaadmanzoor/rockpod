@@ -33,6 +33,9 @@
 #include "dsp_core.h"
 #include "metadata.h"
 #include "settings.h"
+#ifdef USB_ENABLE_AUDIO
+#include "usbstack/usb_audio.h"
+#endif
 
 /* Define LOGF_ENABLE to enable logf output in this file */
 /*#define LOGF_ENABLE*/
@@ -78,6 +81,18 @@ struct codec_load_info
 /** --- Main state control --- **/
 
 static int codec_type = AFMT_UNKNOWN; /* Codec type (C,A-) */
+static int codec_sample_depth = 16; /* Codec fixed-point source depth (C) */
+static int codec_source_sample_depth; /* File source depth before DSP scaling (C) */
+static int codec_stereo_mode = STEREO_NONINTERLEAVED; /* Codec channel layout (C) */
+static unsigned long codec_frequency; /* Codec source frequency in Hz (C) */
+
+static void codec_source_format_reset(void)
+{
+    codec_sample_depth = 16;
+    codec_source_sample_depth = 0;
+    codec_stereo_mode = STEREO_NONINTERLEAVED;
+    codec_frequency = 0;
+}
 
 /* Private interfaces to main playback control */
 extern void audio_codec_update_elapsed(unsigned long elapsed);
@@ -223,17 +238,191 @@ void codec_thread_do_callback(void (*fn)(void), unsigned int *id)
 
 /** --- codec API callbacks --- **/
 
-static void codec_pcmbuf_insert_callback(
+static bool codec_insert_queue_ready(void)
+{
+    return LIKELY(queue_empty(&codec_queue)) ||
+           codec_check_queue__have_msg() >= 0;
+}
+
+static void codec_insert_wait_for_buffer(void)
+{
+    cancel_cpu_boost();
+
+    /* It may be awhile before space is available but we want
+       "instant" response to any message */
+    queue_wait_w_tmo(&codec_queue, NULL, HZ/20);
+}
+
+#if defined(USB_ENABLE_AUDIO) && defined(IPOD_6G)
+static void codec_usb_source_flush_callback(void)
+{
+    if (usb_audio_source_streaming())
+        usb_audio_source_flush();
+}
+
+static bool codec_usb_source_pcm16_pending(void)
+{
+    /* Do not steal the USB source from queued fallback PCM. */
+    return usb_audio_get_source_mode() == USB_AUDIO_SOURCE_MODE_PCM16 &&
+           (usb_audio_get_source_ring_available() > 0 ||
+            pcmbuf_free() < pcmbuf_get_bufsize());
+}
+
+static void codec_usb_source_wait_for_buffer(void);
+
+static bool codec_usb_source_select_pcm16_fallback(unsigned int track_bitrate)
+{
+    while (usb_audio_source_streaming() &&
+           !usb_audio_source_use_pcm16_fallback(track_bitrate) &&
+           codec_insert_queue_ready())
+        codec_usb_source_wait_for_buffer();
+
+    return !usb_audio_source_streaming() ||
+           usb_audio_get_source_mode() == USB_AUDIO_SOURCE_MODE_PCM16;
+}
+
+static void codec_usb_source_wait_for_buffer(void)
+{
+    unsigned long frequency = usb_audio_get_source_sampling_frequency();
+    int bytes_per_sample = usb_audio_get_source_usb_bits() / 8;
+    int available = usb_audio_get_source_ring_available();
+    long ticks = HZ/20;
+
+    if (available > 0 && frequency > 0 && bytes_per_sample > 0)
+    {
+        unsigned long bytes_per_second = frequency * 2 * bytes_per_sample;
+        long drain_ticks = ((int64_t)available * HZ +
+                            bytes_per_second - 1) / bytes_per_second;
+
+        ticks = MIN(ticks, MAX(drain_ticks, 1));
+    }
+
+    cancel_cpu_boost();
+
+    /* Same queue wait pattern as the stock pcmbuf path, with a shorter
+       timeout near a USB source drain boundary to avoid inserting silence
+       between tracks with different sample rates. */
+    queue_wait_w_tmo(&codec_queue, NULL, ticks);
+}
+
+static void codec_usb_source_boost_for_buffer(void)
+{
+    unsigned long frequency = usb_audio_get_source_sampling_frequency();
+    int bytes_per_sample = usb_audio_get_source_usb_bits() / 8;
+    int watermark = frequency * 2 * bytes_per_sample;
+
+    if (usb_audio_get_source_ring_available() < watermark)
+        trigger_cpu_boost();
+    else
+        cancel_cpu_boost();
+}
+
+static void codec_usb_source_discard_pcm(void)
+{
+    if (pcmbuf_free() < pcmbuf_get_bufsize())
+    {
+        logf("codec: USB source clear PCM buffer for ALAC direct");
+        pcmbuf_play_stop();
+    }
+}
+
+static bool codec_usb_source_insert_callback(
         const void *ch1, const void *ch2, int count)
 {
+    if (!usb_audio_source_streaming())
+        return false;
+
+    if (codec_type != AFMT_MP4_ALAC || codec_stereo_mode != STEREO_NONINTERLEAVED ||
+        !ci.id3)
+    {
+        if (ci.id3 && !codec_usb_source_select_pcm16_fallback(ci.id3->bitrate))
+            return true;
+
+        return false;
+    }
+
+    unsigned long frequency = ci.id3->frequency ? ci.id3->frequency
+                                                : codec_frequency;
+
+    int file_depth = codec_source_sample_depth > 0 ?
+                     codec_source_sample_depth : codec_sample_depth + 1;
+
+    if (count <= 0)
+        return true;
+
+    while (codec_usb_source_pcm16_pending() &&
+           codec_insert_queue_ready())
+        codec_usb_source_wait_for_buffer();
+
+    if (!codec_insert_queue_ready())
+        return true;
+
+    bool entering_alac_direct =
+        usb_audio_get_source_mode() != USB_AUDIO_SOURCE_MODE_ALAC;
+
     struct dsp_buffer src;
     src.remcount  = count;
     src.pin[0]    = ch1;
     src.pin[1]    = ch2;
     src.proc_mask = 0;
 
-    while (LIKELY(queue_empty(&codec_queue)) ||
-           codec_check_queue__have_msg() >= 0)
+    while (codec_insert_queue_ready())
+    {
+        int inserted = usb_audio_source_insert_alac(
+            src.pin[0], src.pin[1], src.remcount, codec_sample_depth,
+            file_depth, frequency, ci.id3->bitrate);
+
+        if (inserted == 0)
+        {
+            codec_usb_source_wait_for_buffer();
+        }
+        else
+        {
+            if (inserted < 0)
+            {
+                if (!codec_usb_source_select_pcm16_fallback(ci.id3->bitrate))
+                    return true;
+
+                return false;
+            }
+
+            src.pin[0] = (const int32_t *)src.pin[0] + inserted;
+            src.pin[1] = (const int32_t *)src.pin[1] + inserted;
+            src.remcount -= inserted;
+
+            if (entering_alac_direct)
+            {
+                codec_usb_source_discard_pcm();
+                entering_alac_direct = false;
+            }
+
+            codec_usb_source_boost_for_buffer();
+
+            if (src.remcount <= 0)
+                return true;
+        }
+    }
+
+    return true;
+}
+#endif
+
+static void codec_pcmbuf_insert_callback(
+        const void *ch1, const void *ch2, int count)
+{
+#if defined(USB_ENABLE_AUDIO) && defined(IPOD_6G)
+    if (usb_audio_source_streaming() &&
+        codec_usb_source_insert_callback(ch1, ch2, count))
+        return;
+#endif
+
+    struct dsp_buffer src;
+    src.remcount  = count;
+    src.pin[0]    = ch1;
+    src.pin[1]    = ch2;
+    src.proc_mask = 0;
+
+    while (codec_insert_queue_ready())
     {
         struct dsp_buffer dst;
         dst.remcount = 0;
@@ -241,11 +430,7 @@ static void codec_pcmbuf_insert_callback(
 
         if ((dst.p16out = pcmbuf_request_buffer(&dst.bufcount)) == NULL)
         {
-            cancel_cpu_boost();
-
-            /* It may be awhile before space is available but we want
-               "instant" response to any message */
-            queue_wait_w_tmo(&codec_queue, NULL, HZ/20);
+            codec_insert_wait_for_buffer();
         }
         else
         {
@@ -339,6 +524,10 @@ static void codec_seek_complete_callback(void)
 {
     logf("seek_complete");
 
+#if defined(USB_ENABLE_AUDIO) && defined(IPOD_6G)
+    codec_usb_source_flush_callback();
+#endif
+
     /* Clear DSP */
     dsp_configure(ci.dsp, DSP_FLUSH, 0);
 
@@ -358,7 +547,34 @@ static void codec_seek_complete_callback(void)
 
 static void codec_configure_callback(int setting, intptr_t value)
 {
+    switch (setting)
+    {
+    case DSP_RESET:
+        codec_source_format_reset();
+        break;
+
+    case DSP_SET_SAMPLE_DEPTH:
+        codec_sample_depth = value;
+        break;
+
+    case DSP_SET_STEREO_MODE:
+        codec_stereo_mode = value;
+        break;
+
+    case DSP_SET_FREQUENCY:
+        codec_frequency = value;
+        break;
+
+    default:
+        break;
+    }
+
     dsp_configure(ci.dsp, setting, value);
+}
+
+static void codec_set_source_sample_depth_callback(int bits)
+{
+    codec_source_sample_depth = bits;
 }
 
 static long codec_get_command_callback(intptr_t *param)
@@ -471,6 +687,7 @@ static void load_codec(const struct codec_load_info *ev_data)
     if (!encoder)
     {
         /* Do this now because codec may set some things up at load time */
+        codec_source_format_reset();
         dsp_configure(ci.dsp, DSP_RESET, 0);
     }
 
@@ -571,6 +788,7 @@ static void unload_codec(void)
 {
     /* Tell codec to clean up */
     codec_type = AFMT_UNKNOWN;
+    codec_source_format_reset();
     codec_close();
 }
 
@@ -656,6 +874,7 @@ void INIT_ATTR codec_thread_init(void)
     ci.get_command      = codec_get_command_callback;
     ci.loop_track       = codec_loop_track_callback;
     ci.strip_filesize = codec_strip_filesize_callback;
+    ci.set_source_sample_depth = codec_set_source_sample_depth_callback;
 
     /* Init threading */
     queue_init(&codec_queue, false);
@@ -719,6 +938,10 @@ bool codec_pause(void)
 /* Stop codec if running - codec stays resident if loaded */
 void codec_stop(void)
 {
+#if defined(USB_ENABLE_AUDIO) && defined(IPOD_6G)
+    codec_usb_source_flush_callback();
+#endif
+
     /* Wait until it's in the main loop */
     LOGFQUEUE("audio >| codec Q_CODEC_STOP: 0");
     while (codec_queue_send(Q_CODEC_STOP, 0) != Q_NULL);

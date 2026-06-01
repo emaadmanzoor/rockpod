@@ -28,6 +28,7 @@
 #include "string.h"
 #include "system.h"
 #include "usb_core.h"
+#include "usb_audio.h"
 #include "usb_drv.h"
 #include "kernel.h"
 #include "sound.h"
@@ -55,6 +56,17 @@
 /* Fixed-point conversion macros (signed Q16.16) */
 #define TO_16DOT16_FIXEDPT(val) ((int32_t)(val) * (1<<16))
 #define TO_DOUBLE(val) ((double)(val) / (1<<16))
+
+/* Source mode is used only for iPod -> external USB DAC output on this fork.
+ * Keep native iPod playback at Rockbox's normal 16-bit path, but expose a
+ * 24-bit USB container to DACs that support it. */
+#define SOURCE_USB_CHANNELS        2
+#define SOURCE_USB_BITS            24
+#define SOURCE_USB_BYTES_PER_SAMPLE 3
+#define SOURCE_USB_FRAME_BYTES \
+    (SOURCE_USB_CHANNELS * SOURCE_USB_BYTES_PER_SAMPLE)
+#define SOURCE_USB_MAX_PACKET_SIZE (48 * SOURCE_USB_FRAME_BYTES)
+#define SOURCE_USB_SAMFREQ_COUNT   2
 
 /* Audio Control Interface */
 static struct usb_interface_descriptor
@@ -368,16 +380,16 @@ static struct usb_as_interface
 static struct usb_as_format_type_i_discrete
     as_source_format_type_i =
 {
-    .bLength            = USB_AS_SIZEOF_FORMAT_TYPE_I_DISCRETE(HW_NUM_FREQ),
+    .bLength            = USB_AS_SIZEOF_FORMAT_TYPE_I_DISCRETE(SOURCE_USB_SAMFREQ_COUNT),
     .bDescriptorType    = USB_DT_CS_INTERFACE,
     .bDescriptorSubType = USB_AS_FORMAT_TYPE,
     .bFormatType        = USB_AS_FORMAT_TYPE_I,
     .bNrChannels        = 2, /* Stereo */
-    .bSubframeSize      = 2, /* 2 bytes per sample */
-    .bBitResolution     = 16,
-    .bSamFreqType       = HW_NUM_FREQ,
+    .bSubframeSize      = SOURCE_USB_BYTES_PER_SAMPLE,
+    .bBitResolution     = SOURCE_USB_BITS,
+    .bSamFreqType       = SOURCE_USB_SAMFREQ_COUNT,
     .tSamFreq           = {
-        [0 ... HW_NUM_FREQ - 1] = {0}, /* filled later */
+        [0 ... SOURCE_USB_SAMFREQ_COUNT - 1] = {0}, /* filled later */
     }
 };
 
@@ -389,7 +401,7 @@ static struct usb_as_iso_audio_endpoint
     .bDescriptorType  = USB_DT_ENDPOINT,
     .bEndpointAddress = USB_DIR_IN, /* filled later */
     .bmAttributes     = USB_ENDPOINT_XFER_ISOC | USB_ENDPOINT_SYNC_NONE | USB_ENDPOINT_USAGE_DATA,
-    .wMaxPacketSize   = 192, /* 48000 Hz * 2ch * 2bytes / 1000 */
+    .wMaxPacketSize   = SOURCE_USB_MAX_PACKET_SIZE,
     .bInterval        = 0, /* filled later */
     .bRefresh         = 0,
     .bSynchAddress    = 0
@@ -577,25 +589,32 @@ static int frames_dropped = 0;
 static bool usbaudio_active = false;
 
 /* ===== Source mode (iPod -> USB host) TX ring buffer ===== */
-/* Max bytes per USB frame: 48000Hz * 2ch * 2bytes / 1000 = 192 bytes */
-#define TX_FRAME_SIZE 192
-/* Ring buffer size: ~8.7s at 48kHz — large enough to absorb codec
- * decode bursts and I2S vs USB clock drift (44117 vs 44100 Hz).
- * At 70.6 bytes/sec drift, takes ~6.2 hours continuous play to reach
- * the 75% write-throttle threshold from midpoint. */
-#define TX_RING_SIZE (TX_FRAME_SIZE * 16384)
-/* Pre-buffering threshold: fixed ~24KB (~140ms at 44.1kHz).
- * Must not scale with ring buffer size or startup delay grows. */
-#define SOURCE_PREBUF_BYTES (TX_FRAME_SIZE * 128)
+/* Max bytes per USB frame: 48000Hz * 2ch * 3bytes / 1000 = 288 bytes */
+#define TX_FRAME_SIZE SOURCE_USB_MAX_PACKET_SIZE
+/* Keep the pinned source ring at 3 MiB. This is still about 11 seconds of
+ * 48 kHz stereo s24le, but avoids taking an extra 1.5 MiB from Rockbox's
+ * audio/file buffers when the USB source endpoint is active. */
+#define TX_RING_SIZE (3 * 1024 * 1024)
 static unsigned char *tx_ring_buf;
 static int tx_ring_buf_handle;
-static volatile int tx_write_pos; /* byte offset, updated by buffer hook */
+static volatile int tx_write_pos; /* byte offset, updated by codec thread */
 static volatile int tx_read_pos;  /* byte offset, updated by ISO IN completion */
 static bool source_streaming = false;
-static bool source_prebuffering = false;
-#define SOURCE_FADE_FRAMES 32 /* stereo frames to fade-in over (~0.7ms at 44.1kHz) */
-static int source_fade_pos;
-static int16_t source_last_sample[2]; /* last L/R sample for fade-out on underflow */
+static volatile bool source_paused = false;
+enum source_data_mode
+{
+    SOURCE_DATA_PENDING = USB_AUDIO_SOURCE_MODE_PENDING,
+    SOURCE_DATA_PCM16 = USB_AUDIO_SOURCE_MODE_PCM16,
+    SOURCE_DATA_ALAC = USB_AUDIO_SOURCE_MODE_ALAC,
+};
+static volatile enum source_data_mode source_data_mode = SOURCE_DATA_PENDING;
+static int source_codec_depth;
+static int source_file_depth;
+static unsigned long source_track_frequency;
+static unsigned long source_pending_frequency;
+static unsigned int source_track_bitrate;
+static unsigned long source_usb_bitrate;
+static unsigned long source_pcm_bitrate;
 /* Fractional sample accumulator for non-integer sample rates (e.g. 44.1kHz).
  * At 44.1kHz, we need 44.1 samples/frame. We track the fractional remainder
  * and send an extra sample every 10th frame (9x44 + 1x45 = 441 per 10ms). */
@@ -604,24 +623,23 @@ static volatile int source_underflow_count;
 static volatile int source_frames_sent;
 /* Double buffer for ISO IN: one buffer is being DMA'd while the other
  * is being filled.  This decouples the time-sensitive DMA re-arm
- * (~1us) from the slower audio pull + fade-in (~100us at 54MHz). */
+ * (~1us) from source buffer fill work. */
 static unsigned char tx_buf[2][TX_FRAME_SIZE] USB_DEVBSS_ATTR;
 static int tx_buf_idx;       /* index of buffer currently being DMA'd */
 static int tx_next_bytes;    /* pre-computed frame size for next re-arm */
 
-/* USB-driven pull mode state (replaces ring buffer in source mode).
- * Audio data is pulled directly from the PCM mixer at USB frame rate,
- * adapted from rockbox-mojyack's batch_get_more() pattern. */
+/* PCM16 fallback pull state.  ALAC direct mode uses tx_ring_buf instead. */
 static const void *source_pull_buf;     /* current buffer from PCM mixer */
 static size_t source_pull_size;         /* total size of current buffer */
 static size_t source_pull_cursor;       /* bytes consumed from current buffer */
-static bool source_pull_mode = false;   /* true when USB ISR drives audio */
+static volatile bool source_pull_mode = false; /* true when USB ISR drives audio */
 
 static void set_source_sampling_frequency(unsigned long f);
+static int source_ring_available_bytes(void);
 
 /* DMA inhibit flag defined in pcm-s5l8702.c — prevents I2S DMA restart
  * when the PCM engine internally calls pcm_play_dma_start() during
- * pull mode. */
+ * source mode. */
 extern volatile bool pcm_dma_start_inhibit;
 
 /* Schematic view of the RX situation:
@@ -729,14 +747,11 @@ void usb_audio_init(void)
         logf("usbaudio: playback %lu Hz", hw_freq_sampr[i]);
         encode3(as_playback_format_type_i.tSamFreq[i], hw_freq_sampr[i]);
     }
-    /* source: all hardware-supported rates in ascending order (matches Apple layout) */
-    for(i = 0; i < HW_NUM_FREQ; i++)
-    {
-        /* hw_freq_sampr is descending; reverse into ascending for Apple compatibility */
-        int src_idx = HW_NUM_FREQ - 1 - i;
-        logf("usbaudio: source %lu Hz", hw_freq_sampr[src_idx]);
-        encode3(as_source_format_type_i.tSamFreq[i], hw_freq_sampr[src_idx]);
-    }
+    /* source: USB DAC path is intentionally limited to 44.1/48 kHz */
+    logf("usbaudio: source %lu Hz", (unsigned long)SAMPR_44);
+    encode3(as_source_format_type_i.tSamFreq[0], SAMPR_44);
+    logf("usbaudio: source %lu Hz", (unsigned long)SAMPR_48);
+    encode3(as_source_format_type_i.tSamFreq[1], SAMPR_48);
 }
 
 int usb_audio_request_buf(void)
@@ -980,13 +995,21 @@ static void usb_audio_stop_playback(void)
 
 /* ===== Source mode (iPod -> USB host) ===== */
 
+static bool source_frequency_supported(unsigned long f)
+{
+    return f == SAMPR_44 || f == SAMPR_48;
+}
+
+static bool source_freq_idx_supported(int idx)
+{
+    return source_frequency_supported(hw_freq_sampr[idx]);
+}
+
 /*
  * Compute number of bytes to send in this USB frame.
  * Handles non-integer sample rates (e.g. 44100 Hz / 1000 = 44.1 samples/frame)
- * using a fractional accumulator. Uses the nominal frequency requested by
- * the host, or the mixer frequency if the host has not requested one.
- * The write-side throttle in source_buffer_hook()
- * handles the I2S vs USB clock drift.
+ * using a fractional accumulator. Uses the source endpoint frequency selected
+ * by the host, the current track, or the mixer fallback.
  */
 static int source_frame_bytes(void)
 {
@@ -1006,13 +1029,16 @@ static int source_frame_bytes(void)
         samples = base_samples;
     }
 
-    return samples * 4; /* stereo 16-bit: 2 channels * 2 bytes */
+    return samples * SOURCE_USB_FRAME_BYTES;
 }
 
-static void set_source_sampling_frequency(unsigned long f)
+static void source_apply_sampling_frequency(unsigned long f)
 {
     for(int i = 0; i < HW_NUM_FREQ; i++)
     {
+        if (!source_freq_idx_supported(i))
+            continue;
+
         int err = abs((long)hw_freq_sampr[i] - (long)f);
         int best_err = abs((long)hw_freq_sampr[as_source_freq_idx] - (long)f);
         if(err < best_err)
@@ -1024,6 +1050,42 @@ static void set_source_sampling_frequency(unsigned long f)
     if (!source_streaming)
         logf("usbaudio: set source sampling frequency to %lu Hz for a requested %lu Hz",
             hw_freq_sampr[as_source_freq_idx], f);
+}
+
+static bool source_alac_draining(void)
+{
+    return source_data_mode == SOURCE_DATA_ALAC &&
+           source_ring_available_bytes() > 0;
+}
+
+static bool source_sampling_frequency_busy(unsigned long f)
+{
+    return source_streaming &&
+           source_track_frequency != f &&
+           source_alac_draining();
+}
+
+static void source_apply_pending_sampling_frequency(void)
+{
+    if (source_pending_frequency == 0 ||
+        source_sampling_frequency_busy(source_pending_frequency))
+        return;
+
+    unsigned long f = source_pending_frequency;
+    source_pending_frequency = 0;
+    source_apply_sampling_frequency(f);
+}
+
+static void set_source_sampling_frequency(unsigned long f)
+{
+    if (source_sampling_frequency_busy(f))
+    {
+        source_pending_frequency = f;
+        return;
+    }
+
+    source_pending_frequency = 0;
+    source_apply_sampling_frequency(f);
 }
 
 static void usb_audio_sync_source_sampling_frequency(void)
@@ -1038,144 +1100,425 @@ void usb_audio_set_source_sampling_frequency(unsigned long f)
     set_source_sampling_frequency(f);
 }
 
-/* Ring buffer hook for legacy (non-pull) source mode.
- * Currently unused — pull mode drives audio from the USB ISR directly.
- * Kept for potential fallback. */
-static void source_buffer_hook(const void *start, size_t size) __attribute__((unused));
-static void source_buffer_hook(const void *start, size_t size)
+static int source_ring_available_bytes(void)
 {
-    if (!source_streaming || !tx_ring_buf)
-        return;
-
-    /* compute available space in ring buffer */
     int write = tx_write_pos;
     int read = tx_read_pos;
-    int space;
+
     if (write >= read)
-        space = TX_RING_SIZE - (write - read) - 1;
+        return write - read;
     else
-        space = read - write - 1;
-
-    int to_copy = MIN((int)size, space);
-    to_copy &= ~3; /* round down to sample frame boundary (4 bytes) */
-
-    /* Write-side drift safety: when ring buffer is >75% full,
-     * skip 1 stereo sample from input to prevent overflow.
-     * Keeps USB packet sizes constant for MFi DAC compatibility.
-     * With actual I2S rate, this only fires after hours of
-     * continuous play under worst-case crystal mismatch. */
-    if (to_copy > 4)
-    {
-        int used = TX_RING_SIZE - 1 - space;
-        if (used > TX_RING_SIZE * 3 / 4)
-            to_copy -= 4;
-    }
-
-    if (to_copy <= 0)
-        return;
-
-    const unsigned char *src = (const unsigned char *)start;
-
-    /* copy with wraparound */
-    int first = MIN(to_copy, TX_RING_SIZE - write);
-    memcpy(tx_ring_buf + write, src, first);
-    if (to_copy > first)
-        memcpy(tx_ring_buf, src + first, to_copy - first);
-
-    tx_write_pos = (write + to_copy) % TX_RING_SIZE;
+        return TX_RING_SIZE - read + write;
 }
 
-/* Fill a buffer with audio data from the PCM mixer.
- * Pulls audio, applies fade-in, saves last sample.
- * Called from ISR context (fast_transfer_complete) and
- * from thread context (start_source pre-fill). */
-static void source_fill_buffer(unsigned char *buf, int frame_bytes)
+static int source_ring_space_bytes(void)
+{
+    return TX_RING_SIZE - source_ring_available_bytes() - 1;
+}
+
+static void source_ring_reset(void)
+{
+    tx_write_pos = 0;
+    tx_read_pos = 0;
+}
+
+void usb_audio_source_flush(void)
+{
+    if (!source_streaming)
+        return;
+
+    int oldlevel = disable_irq_save();
+    source_data_mode = SOURCE_DATA_PENDING;
+    source_codec_depth = 0;
+    source_file_depth = 0;
+    source_track_frequency = 0;
+    source_pending_frequency = 0;
+    source_track_bitrate = 0;
+    source_usb_bitrate = 0;
+    source_pcm_bitrate = 0;
+    source_pull_mode = true;
+    source_pull_buf = NULL;
+    source_pull_size = 0;
+    source_pull_cursor = 0;
+    source_ring_reset();
+    restore_irq(oldlevel);
+
+    logf("usbaudio: source flush");
+}
+
+void usb_audio_source_pause(bool pause)
+{
+    if (!source_streaming)
+        return;
+
+    source_paused = pause;
+    logf("usbaudio: source %s", pause ? "pause" : "resume");
+}
+
+static int32_t source_sample_to_s24(int32_t sample, int codec_depth)
+{
+    /* Codec samples are already scaled to codec_depth + sign.  Preserve the
+     * source bits by repacking that pre-DSP sample into the 24-bit USB slot. */
+    int shift = codec_depth + 1 - SOURCE_USB_BITS;
+
+    if (shift > 0)
+        return sample >> shift;
+    else if (shift < 0)
+        return sample << -shift;
+    else
+        return sample;
+}
+
+static void source_store_s24le(unsigned char *buf, int32_t sample)
+{
+    buf[0] = sample & 0xff;
+    buf[1] = (sample >> 8) & 0xff;
+    buf[2] = (sample >> 16) & 0xff;
+}
+
+static void source_ring_write_byte(int *write, unsigned char byte)
+{
+    tx_ring_buf[*write] = byte;
+    if (++(*write) >= TX_RING_SIZE)
+        *write = 0;
+}
+
+static void source_ring_write_s24le(int *write, int32_t sample)
+{
+    if (*write <= TX_RING_SIZE - SOURCE_USB_BYTES_PER_SAMPLE)
+    {
+        source_store_s24le(tx_ring_buf + *write, sample);
+        *write += SOURCE_USB_BYTES_PER_SAMPLE;
+        if (*write == TX_RING_SIZE)
+            *write = 0;
+    }
+    else
+    {
+        source_ring_write_byte(write, sample & 0xff);
+        source_ring_write_byte(write, (sample >> 8) & 0xff);
+        source_ring_write_byte(write, (sample >> 16) & 0xff);
+    }
+}
+
+static void source_fill_from_ring(unsigned char *buf, int frame_bytes)
 {
     int fill = 0;
 
     while (fill < frame_bytes)
     {
-        if (source_pull_cursor >= source_pull_size)
-        {
-            if (!pcm_play_dma_complete_callback(PCM_DMAST_OK,
-                    &source_pull_buf, &source_pull_size))
-            {
-                memset(buf + fill, 0, frame_bytes - fill);
-                fill = frame_bytes;
-                source_underflow_count++;
-                source_fade_pos = 0;
-                break;
-            }
+        int read = tx_read_pos;
+        int avail = source_ring_available_bytes();
+        int copy = MIN(frame_bytes - fill, avail);
+        copy -= copy % SOURCE_USB_FRAME_BYTES;
 
-            pcm_play_dma_status_callback(PCM_DMAST_STARTED);
-            source_pull_cursor = 0;
-        }
+        if (copy <= 0)
+            break;
 
-        size_t avail = source_pull_size - source_pull_cursor;
-        size_t need = (size_t)(frame_bytes - fill);
-        size_t copy = (avail < need) ? avail : need;
+        int first = MIN(copy, TX_RING_SIZE - read);
+        memcpy(buf + fill, tx_ring_buf + read, first);
+        if (copy > first)
+            memcpy(buf + fill + first, tx_ring_buf, copy - first);
 
-        memcpy(buf + fill,
-               (const unsigned char *)source_pull_buf + source_pull_cursor,
-               copy);
-        source_pull_cursor += copy;
-        fill += (int)copy;
+        tx_read_pos = (read + copy) % TX_RING_SIZE;
+        fill += copy;
     }
 
-    /* Fade-in: ramp from silence to full amplitude */
-    if (source_fade_pos < SOURCE_FADE_FRAMES)
+    if (fill < frame_bytes)
     {
-        int16_t *s = (int16_t *)buf;
-        int n = frame_bytes / 4;
-        int i;
-        for (i = 0; i < n && source_fade_pos < SOURCE_FADE_FRAMES; i++)
-        {
-            int32_t gain = (source_fade_pos * 32768) / (SOURCE_FADE_FRAMES - 1);
-            s[i*2]   = (int16_t)((s[i*2]   * gain) >> 15);
-            s[i*2+1] = (int16_t)((s[i*2+1] * gain) >> 15);
-            source_fade_pos++;
-        }
+        memset(buf + fill, 0, frame_bytes - fill);
+        source_underflow_count++;
     }
 
-    /* Save last sample for fade-out if underflow occurs */
+    source_apply_pending_sampling_frequency();
+}
+
+static bool source_pcm16_have_frame(void)
+{
+    if (source_pull_cursor + 4 <= source_pull_size)
+        return true;
+
+    if (!pcm_play_dma_complete_callback(PCM_DMAST_OK,
+            &source_pull_buf, &source_pull_size))
+        return false;
+
+    pcm_play_dma_status_callback(PCM_DMAST_STARTED);
+    source_pull_cursor = 0;
+
+    return source_pull_size >= 4;
+}
+
+static void source_pcm16_pull_reset(void)
+{
+    source_pull_mode = false;
+    source_pull_buf = NULL;
+    source_pull_size = 0;
+    source_pull_cursor = 0;
+}
+
+static void source_drain_pcm16(int frame_bytes)
+{
+    int frames = frame_bytes / SOURCE_USB_FRAME_BYTES;
+
+    for (int i = 0; i < frames; i++)
     {
-        int16_t *s = (int16_t *)buf;
-        int n = frame_bytes / 4;
-        if (n > 0)
+        if (!source_pcm16_have_frame())
         {
-            source_last_sample[0] = s[(n-1)*2];
-            source_last_sample[1] = s[(n-1)*2+1];
+            source_pcm16_pull_reset();
+            break;
         }
+
+        source_pull_cursor += 4;
     }
+}
+
+static void source_fill_from_pcm16(unsigned char *buf, int frame_bytes)
+{
+    int fill = 0;
+
+    while (fill < frame_bytes)
+    {
+        if (!source_pcm16_have_frame())
+        {
+            memset(buf + fill, 0, frame_bytes - fill);
+            source_underflow_count++;
+            break;
+        }
+
+        const unsigned char *src =
+            (const unsigned char *)source_pull_buf + source_pull_cursor;
+        int16_t left, right;
+
+        memcpy(&left, src, sizeof(left));
+        memcpy(&right, src + sizeof(left), sizeof(right));
+
+        source_store_s24le(buf + fill, ((int32_t)left) << 8);
+        source_store_s24le(buf + fill + SOURCE_USB_BYTES_PER_SAMPLE,
+                           ((int32_t)right) << 8);
+
+        source_pull_cursor += 4;
+        fill += SOURCE_USB_FRAME_BYTES;
+    }
+}
+
+/* Fill a buffer with 24-bit USB audio data.
+ * Called from ISR context (fast_transfer_complete) and
+ * from thread context (start_source pre-fill). */
+static void source_fill_buffer(unsigned char *buf, int frame_bytes)
+{
+    if (source_paused)
+    {
+        memset(buf, 0, frame_bytes);
+        return;
+    }
+
+    switch (source_data_mode)
+    {
+    case SOURCE_DATA_ALAC:
+        source_fill_from_ring(buf, frame_bytes);
+        break;
+
+    case SOURCE_DATA_PCM16:
+        source_fill_from_pcm16(buf, frame_bytes);
+        break;
+
+    case SOURCE_DATA_PENDING:
+    default:
+        /* Drain queued post-DSP PCM as silence until the codec either switches
+         * to ALAC direct or explicitly selects PCM16 fallback. */
+        if (source_pull_mode)
+            source_drain_pcm16(frame_bytes);
+        memset(buf, 0, frame_bytes);
+        break;
+    }
+}
+
+static unsigned long source_pcm_bitrate_kbps(unsigned long frequency,
+                                             int bits_per_sample)
+{
+    return frequency * SOURCE_USB_CHANNELS * bits_per_sample / 1000;
+}
+
+static bool source_select_alac(unsigned long frequency,
+                               int codec_depth,
+                               int file_depth,
+                               unsigned int track_bitrate)
+{
+    bool same_transport = source_data_mode == SOURCE_DATA_ALAC &&
+                          source_track_frequency == frequency;
+
+    if (same_transport)
+        source_pending_frequency = 0;
+
+    if (same_transport &&
+        source_codec_depth == codec_depth &&
+        source_file_depth == file_depth &&
+        source_track_bitrate == track_bitrate)
+        return false;
+
+    if (!same_transport)
+    {
+        int oldlevel = disable_irq_save();
+        source_pcm16_pull_reset();
+        source_data_mode = SOURCE_DATA_PENDING;
+        source_track_frequency = frequency;
+        source_codec_depth = codec_depth;
+        source_file_depth = file_depth;
+        source_track_bitrate = track_bitrate;
+        source_usb_bitrate = source_pcm_bitrate_kbps(frequency, SOURCE_USB_BITS);
+        source_pcm_bitrate = source_pcm_bitrate_kbps(frequency, file_depth);
+        source_ring_reset();
+        restore_irq(oldlevel);
+        set_source_sampling_frequency(frequency);
+        logf("usbaudio: source ALAC direct %lu Hz, file %d-bit, USB %d-bit, USB PCM %lu kbps, source PCM %lu kbps, file %u kbps, codec depth %d",
+             frequency, file_depth, SOURCE_USB_BITS, source_usb_bitrate,
+             source_pcm_bitrate, track_bitrate, codec_depth);
+        return true;
+    }
+
+    source_codec_depth = codec_depth;
+    source_file_depth = file_depth;
+    source_track_bitrate = track_bitrate;
+    source_pcm_bitrate = source_pcm_bitrate_kbps(frequency, file_depth);
+    logf("usbaudio: source ALAC track file %d-bit, source PCM %lu kbps, file %u kbps, codec depth %d",
+         file_depth, source_pcm_bitrate, track_bitrate, codec_depth);
+    return false;
+}
+
+static void source_publish_alac(void)
+{
+    int oldlevel = disable_irq_save();
+    source_data_mode = SOURCE_DATA_ALAC;
+    restore_irq(oldlevel);
+}
+
+static void source_select_pcm16_fallback(unsigned int track_bitrate)
+{
+    unsigned long frequency = hw_freq_sampr[as_source_freq_idx];
+    bool same_transport = source_data_mode == SOURCE_DATA_PCM16 &&
+                          source_track_frequency == frequency &&
+                          source_track_bitrate == track_bitrate;
+
+    int oldlevel = disable_irq_save();
+    source_pull_mode = true;
+
+    if (same_transport)
+    {
+        restore_irq(oldlevel);
+        return;
+    }
+
+    source_data_mode = SOURCE_DATA_PCM16;
+    source_track_frequency = frequency;
+    source_pending_frequency = 0;
+    source_codec_depth = 16;
+    source_file_depth = 16;
+    source_track_bitrate = track_bitrate;
+    source_usb_bitrate = source_pcm_bitrate_kbps(frequency, SOURCE_USB_BITS);
+    source_pcm_bitrate = source_pcm_bitrate_kbps(frequency, 16);
+    restore_irq(oldlevel);
+
+    logf("usbaudio: source PCM16 fallback, USB %d-bit, USB PCM %lu kbps, source PCM %lu kbps, file %u kbps",
+         SOURCE_USB_BITS, source_usb_bitrate, source_pcm_bitrate,
+         track_bitrate);
+}
+
+static bool source_alac_supported(unsigned long frequency,
+                                  int codec_depth,
+                                  int file_depth)
+{
+    return source_streaming && tx_ring_buf &&
+           source_frequency_supported(frequency) &&
+           codec_depth + 1 >= file_depth &&
+           (file_depth == 16 || file_depth == 24);
+}
+
+bool usb_audio_source_use_pcm16_fallback(unsigned int track_bitrate)
+{
+    if (!source_streaming)
+        return true;
+
+    if (source_alac_draining())
+        return false;
+
+    source_select_pcm16_fallback(track_bitrate);
+    return true;
+}
+
+int usb_audio_source_insert_alac(const int32_t *ch1, const int32_t *ch2,
+                                 int count, int codec_depth,
+                                 int file_depth,
+                                 unsigned long frequency,
+                                 unsigned int track_bitrate)
+{
+    if (!source_alac_supported(frequency, codec_depth, file_depth))
+        return -1;
+
+    /* A sample-rate change needs a fresh USB cadence, but not by dropping
+     * the tail of the previous direct track. */
+    if (source_track_frequency != frequency && source_alac_draining())
+    {
+        set_source_sampling_frequency(frequency);
+        return 0;
+    }
+
+    bool publish = source_select_alac(frequency, codec_depth, file_depth,
+                                      track_bitrate);
+
+    int space = source_ring_space_bytes();
+    int frames = MIN(count, space / SOURCE_USB_FRAME_BYTES);
+    int write = tx_write_pos;
+
+    for (int i = 0; i < frames; i++)
+    {
+        int32_t left = source_sample_to_s24(ch1[i], codec_depth);
+        int32_t right = source_sample_to_s24(ch2[i], codec_depth);
+        source_ring_write_s24le(&write, left);
+        source_ring_write_s24le(&write, right);
+    }
+
+    tx_write_pos = write;
+
+    if (publish && frames > 0)
+        source_publish_alac();
+
+    return frames;
 }
 
 static void usb_audio_start_source(void)
 {
     usb_audio_sync_source_sampling_frequency();
 
-    logf("usbaudio: start source (pull) at %lu Hz ep=0x%02X", hw_freq_sampr[as_source_freq_idx], EP_ISO_SOURCE_IN);
+    logf("usbaudio: start source at %lu Hz ep=0x%02X USB %d-bit",
+         hw_freq_sampr[as_source_freq_idx], EP_ISO_SOURCE_IN, SOURCE_USB_BITS);
 
+    int audio_stat = audio_status();
     source_streaming = true;
+    source_paused = (audio_stat & AUDIO_STATUS_PLAY) &&
+                    (audio_stat & AUDIO_STATUS_PAUSE);
+    source_data_mode = SOURCE_DATA_PENDING;
     source_pull_mode = true;
-    source_fade_pos = 0;       /* fade-in from silence when data arrives */
-    source_last_sample[0] = 0;
-    source_last_sample[1] = 0;
+    source_codec_depth = 0;
+    source_file_depth = 0;
+    source_track_frequency = hw_freq_sampr[as_source_freq_idx];
+    source_pending_frequency = 0;
+    source_track_bitrate = 0;
+    source_usb_bitrate = source_pcm_bitrate_kbps(source_track_frequency,
+                                                SOURCE_USB_BITS);
+    source_pcm_bitrate = 0;
     source_frac_num = 0;
     source_underflow_count = 0;
     source_frames_sent = 0;
     source_pull_buf = NULL;
     source_pull_size = 0;
     source_pull_cursor = 0;
-    source_prebuffering = false; /* not used in pull mode, clear for clarity */
     tx_write_pos = 0;
     tx_read_pos = 0;
     memset(tx_buf[0], 0, sizeof(tx_buf[0]));
     memset(tx_buf[1], 0, sizeof(tx_buf[1]));
 
-    /* Stop I2S DMA — USB ISR drives PCM data instead.
+    /* Stop I2S DMA — USB ISR drives the source endpoint instead.
      * Inhibit flag prevents mixer from restarting DMA.
-     * Do NOT register source_buffer_hook; data is pulled
-     * directly from the PCM mixer in the XFRC handler. */
+     * The codec thread selects either ALAC direct or PCM16 fallback. */
     pcm_dma_start_inhibit = true;
     pcm_play_dma_stop();
 
@@ -1204,8 +1547,17 @@ static void usb_audio_stop_source(void)
 {
     logf("usbaudio: stop source");
     source_streaming = false;
+    source_paused = false;
+    source_data_mode = SOURCE_DATA_PENDING;
+    source_codec_depth = 0;
+    source_file_depth = 0;
+    source_track_frequency = 0;
+    source_pending_frequency = 0;
+    source_track_bitrate = 0;
+    source_usb_bitrate = 0;
+    source_pcm_bitrate = 0;
 
-    if (source_pull_mode)
+    if (source_pull_mode || pcm_dma_start_inhibit)
     {
         source_pull_mode = false;
         source_pull_buf = NULL;
@@ -1220,7 +1572,7 @@ static void usb_audio_stop_source(void)
         pcm_play_stop();
     }
 
-    /* Clear buffer hook (not set in pull mode, but clear unconditionally) */
+    /* Source transport does not use mixer buffer hooks. */
     mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK, NULL);
 
 #ifdef HAVE_CS42L55
@@ -1732,9 +2084,8 @@ void usb_audio_init_connection(void)
     usbaudio_active = true;
 
     /* DSP setup deferred to usb_audio_start_playback() (sink mode only).
-     * In source mode, the codec's DSP must not be disturbed — it is
-     * actively processing audio that source mode captures via the
-     * mixer buffer hook. */
+     * Source mode must not disturb the codec's DSP: ALAC direct captures
+     * decoder output before DSP, and fallback pulls already-rendered PCM. */
 
     usb_as_playback_intf_alt = 0;
     tmp_saved_vol = sound_current(SOUND_VOLUME);
@@ -1745,6 +2096,15 @@ void usb_audio_init_connection(void)
     as_source_freq_idx = HW_FREQ_DEFAULT;
     source_freq_set_by_host = false;
     source_streaming = false;
+    source_paused = false;
+    source_data_mode = SOURCE_DATA_PENDING;
+    source_codec_depth = 0;
+    source_file_depth = 0;
+    source_track_frequency = 0;
+    source_pending_frequency = 0;
+    source_track_bitrate = 0;
+    source_usb_bitrate = 0;
+    source_pcm_bitrate = 0;
     source_frac_num = 0;
     tx_write_pos = 0;
     tx_read_pos = 0;
@@ -1789,9 +2149,44 @@ unsigned long usb_audio_get_source_sampling_frequency(void)
     return hw_freq_sampr[as_source_freq_idx];
 }
 
+int usb_audio_get_source_mode(void)
+{
+    return source_data_mode;
+}
+
+int usb_audio_get_source_usb_bits(void)
+{
+    return SOURCE_USB_BITS;
+}
+
+int usb_audio_get_source_codec_depth(void)
+{
+    return source_codec_depth;
+}
+
+int usb_audio_get_source_file_depth(void)
+{
+    return source_file_depth;
+}
+
+unsigned long usb_audio_get_source_pcm_bitrate(void)
+{
+    return source_pcm_bitrate;
+}
+
+unsigned int usb_audio_get_source_track_bitrate(void)
+{
+    return source_track_bitrate;
+}
+
+unsigned long usb_audio_get_source_usb_bitrate(void)
+{
+    return source_usb_bitrate;
+}
+
 int usb_audio_get_source_ring_available(void)
 {
-    if (source_pull_mode)
+    if (source_pull_mode || source_data_mode == SOURCE_DATA_PCM16)
         return (int)(source_pull_size - source_pull_cursor);
 
     int write = tx_write_pos;

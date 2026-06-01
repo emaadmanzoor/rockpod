@@ -150,6 +150,7 @@ struct codec_api ci = {
 
     /* new stuff at the end, sort into place next time
        the API gets incompatible */
+    NULL, /* set_source_sample_depth */
 
 };
 
