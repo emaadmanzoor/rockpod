@@ -59,10 +59,12 @@
 
 /* Source mode is used only for iPod -> external USB DAC output on this fork.
  * Keep native iPod playback at Rockbox's normal 16-bit path, but expose a
- * 24-bit USB container to DACs that support it. */
+ * 24-bit USB sample to DACs that support it. Use a 4-byte subframe because
+ * many USB DACs advertise 24 valid bits carried in a 32-bit slot. */
 #define SOURCE_USB_CHANNELS        2
 #define SOURCE_USB_BITS            24
-#define SOURCE_USB_BYTES_PER_SAMPLE 3
+#define SOURCE_USB_BYTES_PER_SAMPLE 4
+#define SOURCE_USB_SLOT_BITS       (SOURCE_USB_BYTES_PER_SAMPLE * 8)
 #define SOURCE_USB_FRAME_BYTES \
     (SOURCE_USB_CHANNELS * SOURCE_USB_BYTES_PER_SAMPLE)
 #define SOURCE_USB_MAX_PACKET_SIZE (48 * SOURCE_USB_FRAME_BYTES)
@@ -1164,16 +1166,27 @@ static int32_t source_sample_to_s24(int32_t sample, int codec_depth)
     if (shift > 0)
         return sample >> shift;
     else if (shift < 0)
-        return sample << -shift;
+        return sample * (1 << -shift);
     else
         return sample;
 }
 
-static void source_store_s24le(unsigned char *buf, int32_t sample)
+static int32_t source_pcm16_to_s24(int16_t sample)
 {
-    buf[0] = sample & 0xff;
-    buf[1] = (sample >> 8) & 0xff;
-    buf[2] = (sample >> 16) & 0xff;
+    return (int32_t)sample * (1 << (SOURCE_USB_BITS - 16));
+}
+
+static void source_store_usb_sample(unsigned char *buf, int32_t sample)
+{
+    uint32_t usb_sample = (uint32_t)sample <<
+        (SOURCE_USB_SLOT_BITS - SOURCE_USB_BITS);
+
+    buf[0] = usb_sample & 0xff;
+    buf[1] = (usb_sample >> 8) & 0xff;
+    buf[2] = (usb_sample >> 16) & 0xff;
+#if SOURCE_USB_BYTES_PER_SAMPLE > 3
+    buf[3] = (usb_sample >> 24) & 0xff;
+#endif
 }
 
 static void source_ring_write_byte(int *write, unsigned char byte)
@@ -1183,20 +1196,22 @@ static void source_ring_write_byte(int *write, unsigned char byte)
         *write = 0;
 }
 
-static void source_ring_write_s24le(int *write, int32_t sample)
+static void source_ring_write_usb_sample(int *write, int32_t sample)
 {
     if (*write <= TX_RING_SIZE - SOURCE_USB_BYTES_PER_SAMPLE)
     {
-        source_store_s24le(tx_ring_buf + *write, sample);
+        source_store_usb_sample(tx_ring_buf + *write, sample);
         *write += SOURCE_USB_BYTES_PER_SAMPLE;
         if (*write == TX_RING_SIZE)
             *write = 0;
     }
     else
     {
-        source_ring_write_byte(write, sample & 0xff);
-        source_ring_write_byte(write, (sample >> 8) & 0xff);
-        source_ring_write_byte(write, (sample >> 16) & 0xff);
+        unsigned char usb_sample[SOURCE_USB_BYTES_PER_SAMPLE];
+
+        source_store_usb_sample(usb_sample, sample);
+        for (int i = 0; i < SOURCE_USB_BYTES_PER_SAMPLE; i++)
+            source_ring_write_byte(write, usb_sample[i]);
     }
 }
 
@@ -1291,9 +1306,9 @@ static void source_fill_from_pcm16(unsigned char *buf, int frame_bytes)
         memcpy(&left, src, sizeof(left));
         memcpy(&right, src + sizeof(left), sizeof(right));
 
-        source_store_s24le(buf + fill, ((int32_t)left) << 8);
-        source_store_s24le(buf + fill + SOURCE_USB_BYTES_PER_SAMPLE,
-                           ((int32_t)right) << 8);
+        source_store_usb_sample(buf + fill, source_pcm16_to_s24(left));
+        source_store_usb_sample(buf + fill + SOURCE_USB_BYTES_PER_SAMPLE,
+                                source_pcm16_to_s24(right));
 
         source_pull_cursor += 4;
         fill += SOURCE_USB_FRAME_BYTES;
@@ -1364,14 +1379,16 @@ static bool source_select_alac(unsigned long frequency,
         source_codec_depth = codec_depth;
         source_file_depth = file_depth;
         source_track_bitrate = track_bitrate;
-        source_usb_bitrate = source_pcm_bitrate_kbps(frequency, SOURCE_USB_BITS);
+        source_usb_bitrate = source_pcm_bitrate_kbps(frequency,
+                                                     SOURCE_USB_SLOT_BITS);
         source_pcm_bitrate = source_pcm_bitrate_kbps(frequency, file_depth);
         source_ring_reset();
         restore_irq(oldlevel);
         set_source_sampling_frequency(frequency);
-        logf("usbaudio: source ALAC direct %lu Hz, file %d-bit, USB %d-bit, USB PCM %lu kbps, source PCM %lu kbps, file %u kbps, codec depth %d",
-             frequency, file_depth, SOURCE_USB_BITS, source_usb_bitrate,
-             source_pcm_bitrate, track_bitrate, codec_depth);
+        logf("usbaudio: source ALAC direct %lu Hz, file %d-bit, USB %d/%d-bit, USB PCM %lu kbps, source PCM %lu kbps, file %u kbps, codec depth %d",
+             frequency, file_depth, SOURCE_USB_BITS, SOURCE_USB_SLOT_BITS,
+             source_usb_bitrate, source_pcm_bitrate, track_bitrate,
+             codec_depth);
         return true;
     }
 
@@ -1413,12 +1430,13 @@ static void source_select_pcm16_fallback(unsigned int track_bitrate)
     source_codec_depth = 16;
     source_file_depth = 16;
     source_track_bitrate = track_bitrate;
-    source_usb_bitrate = source_pcm_bitrate_kbps(frequency, SOURCE_USB_BITS);
+    source_usb_bitrate = source_pcm_bitrate_kbps(frequency,
+                                                 SOURCE_USB_SLOT_BITS);
     source_pcm_bitrate = source_pcm_bitrate_kbps(frequency, 16);
     restore_irq(oldlevel);
 
-    logf("usbaudio: source PCM16 fallback, USB %d-bit, USB PCM %lu kbps, source PCM %lu kbps, file %u kbps",
-         SOURCE_USB_BITS, source_usb_bitrate, source_pcm_bitrate,
+    logf("usbaudio: source PCM16 fallback, USB %d/%d-bit, USB PCM %lu kbps, source PCM %lu kbps, file %u kbps",
+         SOURCE_USB_BITS, SOURCE_USB_SLOT_BITS, source_usb_bitrate, source_pcm_bitrate,
          track_bitrate);
 }
 
@@ -1472,8 +1490,8 @@ int usb_audio_source_insert_alac(const int32_t *ch1, const int32_t *ch2,
     {
         int32_t left = source_sample_to_s24(ch1[i], codec_depth);
         int32_t right = source_sample_to_s24(ch2[i], codec_depth);
-        source_ring_write_s24le(&write, left);
-        source_ring_write_s24le(&write, right);
+        source_ring_write_usb_sample(&write, left);
+        source_ring_write_usb_sample(&write, right);
     }
 
     tx_write_pos = write;
@@ -2157,6 +2175,11 @@ int usb_audio_get_source_mode(void)
 int usb_audio_get_source_usb_bits(void)
 {
     return SOURCE_USB_BITS;
+}
+
+int usb_audio_get_source_usb_slot_bits(void)
+{
+    return SOURCE_USB_SLOT_BITS;
 }
 
 int usb_audio_get_source_codec_depth(void)

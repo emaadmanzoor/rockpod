@@ -300,6 +300,8 @@ int usb_audio_get_source_mode(void);
 
 int usb_audio_get_source_usb_bits(void);
 
+int usb_audio_get_source_usb_slot_bits(void);
+
 int usb_audio_get_source_codec_depth(void);
 
 int usb_audio_get_source_file_depth(void);

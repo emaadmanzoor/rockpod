@@ -2574,8 +2574,9 @@ static int dbg_usb_audio_cb(int action, struct gui_synclist *lists)
     simplelist_addline("Source: %s @ %lu Hz",
         usb_audio_source_streaming()?"Streaming":"Off",
         usb_audio_get_source_sampling_frequency());
-    simplelist_addline("Source mode: %s, USB %d-bit",
-        source_mode, usb_audio_get_source_usb_bits());
+    simplelist_addline("Source mode: %s, USB %d/%d-bit",
+        source_mode, usb_audio_get_source_usb_bits(),
+        usb_audio_get_source_usb_slot_bits());
     simplelist_addline("Source depth: file %d / codec %d",
         usb_audio_get_source_file_depth(),
         usb_audio_get_source_codec_depth());
